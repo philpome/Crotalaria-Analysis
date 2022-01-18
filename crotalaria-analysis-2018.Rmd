@@ -1,0 +1,120 @@
+---
+title: "Crotalaria analysis"
+author: "mphilpott"
+date: "August 7, 2018"
+output:
+  pdf_document: default 
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Survival Analysis
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+
+First, load the data and necessary packages:
+
+
+```{r message=FALSE}
+
+library(asaur)
+library(survival)
+library(forestplot)
+library(muhaz)
+library(survminer)
+library(ggplot2)
+library(psych)
+crotalaria<-read.csv("C:/Users/Megan/Desktop/Crotalaria/crotalaria-ac-v2.csv",header=TRUE)
+attach(crotalaria)
+```
+
+First, some summary stats:
+
+```{r}
+meandata<-data.frame(Time,Proc)
+summary(meandata)
+describe.by(meandata,Proc)
+```
+
+Next, we'll create the survival data structure:
+
+
+```{r}
+plot1<-ggplot(crotalaria, aes(x=Years,y=Time))+
+  geom_point()+
+  labs(x="Years in cryostorage", y="Weeks survived after recovery")+
+  geom_point(aes(colour=factor(Proc)))+
+  labs(colour="Procedure")
+plot1
+result<-coxph(Surv(Time,Delta)~Years,data=crotalaria)
+result
+```
+
+
+Now we'll generate the Kaplan-Meier estimator, a non-parametric estimator of the survival function:
+
+
+```{r}
+result.km<-survfit(Surv(Time,Delta)~Proc,conf.type="log-log")
+summary(result.km)
+ggsurvplot(result.km, xlab="Time (weeks)",ylab="Survival probability", data=crotalaria, pval=TRUE)
+```
+
+
+We'll try the Nelson-Altshuler estimator, another non-parametric estimator, as well: 
+
+
+```{r}
+result.fh<-survfit(Surv(Time,Delta)~Proc,conf.type="log-log",type="fh")
+summary(result.fh)
+ggsurvplot(result.fh, xlab="Time (weeks)",ylab="Survival probability", data=crotalaria, pval=TRUE)
+```
+
+
+They look pretty much the same. Overall probability of survival to 12 weeks is less than 20% for any method used in the study. EVOP has the highest probability of survival at 16%, followed by EV at 15%. EVstrips looks much lower at 8%, and vitrification & ED effectively have a 0% survival. Survival from recovery to 4 weeks is pretty stable for EV & EVOP, but both experience a sharp drop in survival between 4 & 12 weeks.
+
+
+A Cox Proportional Hazards model may provide more insight.
+
+
+```{r}
+fit.coxph<-coxph(Surv(Time,Delta)~Proc)
+summary(fit.coxph)
+ggforest(fit.coxph,data=crotalaria)
+```
+
+
+This backs up the previous two models. The forest plot shows the hazard ratio for each procedure compared to the reference procedure, in our case, ED. A hazard ratio > 1 means that a procedure was associated with a higher risk of dying. In this model, tips cryopreserved with EV or EVOP have a significantly higher chance of survival than tips cryopreserved with ED, EVstrips, or Vitrification. We can see the EVstrips procedure is marginally better than ED or vitrification, but still much lower than EV & EVOP. Let's see if adding in more variables clarifies things.
+
+
+```{r}
+fitall.coxph<-coxph(Surv(Time,Delta)~Proc+Init.Surv+Genotype+Years+Precult.Medium+Operator)
+summary(fitall.coxph)
+```
+
+
+This is complicated. The hazard ratio for each factor is represented by the column exp(coef). Rsquare is 0.184, representing the amount of variation that the present model is able to explain. Clearly, many genotypes are significantly associated with a decreased hazard ratio, which may be skewing our results. So let's try controlling for genotype.We'll have to leave out preculture medium due to lack of data.
+
+
+```{r}
+library(coxme)
+fitall.coxme<-coxme(Surv(Time,Delta)~Proc+Init.Surv+Years+Operator+(1|Genotype))
+summary(fitall.coxme)
+```
+
+Now our results are controlled for genotype effects. A hazard ratio (HR) of greater than 1 is associated with greater risk of dying, and HR<1 is associated with a lower risk of dying. The column exp(coef) represents our HRs. The procedures EV and EVOP are significantly associated with a decreased risk of dying, with EVOP being the best procedure (HR for EV = 0.55, HR for EVOP = 0.30). Increasing initial survival is just barely significantly associated with a decreased risk (HR=0.99), but increasing number of years in storage is more strongly associated with a decreased risk (HR=0.88). This is weird, and I'm not quite sure how to interpret it. Kris (HR=0.68) and Pete (HR=0.60) are significantly associated with decreased risk, but this could be confounded with the techniques they were more likely to be using than anything else. 
+
+We can also try a power analysis to see how many samples we would need to see a significant effect. The power analysis can't take into account the complexity of our model, we can only really try to set up an experiment to test two variables (ideally, one experimental and one control). So, let's use this data to see how many samples we would need to really see a significant effect between EV and EVOP:
+
+
+```{r}
+library(powerSurvEpi)
+ssizeCT.default(power=0.8, k=0.5, pE=0.78, pC=0.74, RR=0.875, alpha=0.05)
+```
+
+
+Power is the probability that we'll reject the null hypothesis when it's actually false, k is the ratio of samples in the control vs. experimental groups, pE is the probability of death for EV samples (calculated from our data), pC is the probability of death for EVOP samples, RR is the hazard ratio for EV samples (again calculated from our data), and alpha is our significance level. It looks like we would need about 1000 shoot tips in EV and 2000 shoot tips in EVOP to really get at whether there's a significant difference between the two treatments. Since there's not a huge difference between those two treatments, this would be a more informative analysis to use with pilot data from a different method, like DV, that would differ more significantly from the previous methods. 

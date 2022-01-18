@@ -1,0 +1,251 @@
+---
+title: "Crotalaria-byvial"
+author: "mphilpott"
+date: "January 17, 2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Crotalaria analysis by vial (1 = at least 1 tip survived)
+
+```{r}
+cro_vial<-read.csv("crotalaria-ac-byvial-noED-noVit.csv",header=TRUE)
+attach(cro_vial)
+library(aod)
+library(ggplot2)
+library(GGally)
+library(lme4)
+library(parallel)
+library(car)
+```
+
+First, look for correlations between variables:
+
+```{r}
+chisq.test(Genotype,Proc)
+ggplot(cro_vial, aes(x = Proc, y = Genotype)) +
+     stat_sum(aes(size = ..n.., group = 1)) +
+     scale_size_area(max_size=10)
+chisq.test(Operator,Proc)
+chisq.test(Years.bin,Proc)
+ggpairs(cro_vial[, c("Init.Surv", "Years", "PVS2.Control")])
+```
+
+Genotype is significantly correlated with procedure, operator is significantly correlated with procedure, time banked is significantly correlated with procedure.
+
+```{r}
+model1.4w<-glm(FourW.alive~Years.bin+Proc+Rec.Medium+Init.Surv+TwoW.Contam+Age.Prec+PVS2.Control+Precult.Medium+Operator, data=cro_vial, family="binomial")
+summary(model1.4w)
+#exponentiate coefficients to get odds ratios
+exp(coef(model1.4w))
+plot(model1.4w)
+```
+
+The full model shows a significant effect of initial survival and Kris as operator. For every unit increase in initial survival, log odds of survival increase by 1.08. Or, holding all other variables constant, one unit increase in initial survival increases the odds of survival by 8%. If Kris is the operator, log odds of survival increase by 2.81, or 181%. This likely is confounded by the procedure and/or genotypes she was using, and we should consider removing operator as a variable. Or maybe Kris is just that good.
+
+This is not a good model. Residuals vs. fitted shows that the model doesn't capture the non-linear relationship between the predictor and the residuals. The QQ plot doesn't look awful, but the lack of fit at the tails shows that the data is likely skewed (this is probably because we have way more 0's than 1's in our response variable). The scale-location plot shows that our variance is wacky. Residuals vs leverage looks decent, so we probably don't have any outliers. We need a new model, however. 
+
+We're not really interested in genotype effects because we can't manipulate genotype and we just have to try and bank them all regardless of success, but it might have an effect on the other variables. So, we'll introduce it as a random variable.
+
+```{r}
+m <- glmer(FourW.alive ~ Years.bin + Proc + Rec.Medium + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + Precult.Medium + Operator + (1 | Genotype), data = cro_vial, family = binomial, control = glmerControl(optimizer = "bobyqa"), nAGQ = 10)
+print(m,corr=FALSE)
+se <- sqrt(diag(vcov(m)))
+tab <- cbind(Est = fixef(m), LL = fixef(m) - 1.96 * se, UL = fixef(m) + 1.96 * se)
+exp(tab)
+```
+
+This table gives us the regression coefficients for each variable. We'll have to use a bootstrapping approach to get significance. Let's steal some bootstrapping code from here (https://stats.idre.ucla.edu/r/dae/mixed-effects-logistic-regression/)
+
+```{r}
+sampler <- function(dat, clustervar, replace = TRUE, reps = 1) {
+    cid <- unique(dat[, clustervar[1]])
+    ncid <- length(cid)
+    recid <- sample(cid, size = ncid * reps, replace = TRUE)
+    if (replace) {
+        rid <- lapply(seq_along(recid), function(i) {
+            cbind(NewID = i, RowID = sample(which(dat[, clustervar] == recid[i]),
+                size = length(which(dat[, clustervar] == recid[i])), replace = TRUE))
+        })
+    } else {
+        rid <- lapply(seq_along(recid), function(i) {
+            cbind(NewID = i, RowID = which(dat[, clustervar] == recid[i]))
+        })
+    }
+    dat <- as.data.frame(do.call(rbind, rid))
+    dat$Replicate <- factor(cut(dat$NewID, breaks = c(1, ncid * 1:reps), include.lowest = TRUE,
+        labels = FALSE))
+    dat$NewID <- factor(dat$NewID)
+    return(dat)
+}
+```
+
+Now we can resample our data, and use the resampled data to refit the model.
+
+```{r}
+set.seed(20)
+tmp <- sampler(cro_vial, "Genotype", reps = 100)
+#NOTE: increase reps if your computer can handle it!!
+bigdata <- cbind(tmp, cro_vial[tmp$RowID, ])
+f <- fixef(m)
+r <- getME(m, "theta")
+cl <- makeCluster(4)
+#NOTE: change 4 to the number of processors you have!
+clusterExport(cl, c("bigdata", "f", "r"))
+clusterEvalQ(cl, require(lme4))
+myboot <- function(i) {
+    object <- try(glmer(FourW.alive ~ Years.bin + Proc + Rec.Medium + Init.Surv +
+        TwoW.Contam + Age.Prec + PVS2.Control + Precult.Medium + Operator + (1 | Genotype), data = bigdata, subset = Replicate == i, family = binomial,
+        nAGQ = 1, start = list(fixef = f, theta = r)), silent = TRUE)
+    if (class(object) == "try-error")
+        return(object)
+    c(fixef(object), getME(object, "theta"))
+}
+start <- proc.time()
+res <- parLapplyLB(cl, X = levels(bigdata$Replicate), fun = myboot)
+end <- proc.time()
+stopCluster(cl)
+```
+
+Let's now summarize the bootstrapped results of our re-fitted model.
+
+```{r}
+#First, let's see how many models successfully converged:
+success <- sapply(res, is.numeric)
+mean(success)
+#Yikes, that's a low number! Increase reps next time if possible.
+bigres <- do.call(cbind, res[success])
+(ci <- t(apply(bigres, 1, quantile, probs = c(0.025, 0.975))))
+finaltable <- cbind(Est = c(f, r), SE = c(se, NA), BootMean = rowMeans(bigres), ci)
+round(finaltable, 3)
+```
+
+Based on bootstrapped confidence intervals, EVOP, 1B gel as recovery medium, initial survival, mannitol + ABA as preculture medium, Bernadette as operator, and Mike as operator are all positively associated with survival. 
+
+However, our model is at risk of multicollinearity, so let's check:
+
+```{r}
+vif(m)
+```
+
+So, let's look at the standardized generalized VIF: over 5 or 10 is grounds for dismissal, so Rec.Medium has got to go. We'll re run the model and VIF values in a stepwise fashion until we're satisfied with the variables we have. 
+
+```{r}
+#first, we'll remove the worst offender - Rec.Medium
+
+vif(glmer(FourW.alive ~ Years.bin + Proc + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + Precult.Medium + Operator + (1 | Genotype), data = cro_vial, family = binomial, control = glmerControl(optimizer = "bobyqa"), nAGQ = 10))
+
+#Now Precult.Medium is the worst offender - let's kill it
+
+vif(glmer(FourW.alive ~ Years.bin + Proc + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + Operator + (1 | Genotype), data = cro_vial, family = binomial, control = glmerControl(optimizer = "bobyqa"), nAGQ = 10))
+```
+
+Removing Precult.Medium and Rec.Medium cleaned up our multicollinearity.
+
+```{r}
+m2 <- glmer(FourW.alive ~ Years.bin + Proc + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + Operator + (1 | Genotype), data = cro_vial, family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)), nAGQ = 10)
+#let's check and make sure the fit isn't singular - if the constrained parameters of the random effects parameters are nearly 0
+tt <- getME(m2,"theta")
+ll <- getME(m2,"lower")
+min(tt[ll==0])
+#we're much higher than 0, so not singular
+#Let's look at overdispersion. I'm inclined to not look at it since our response is binary, but we can just see
+#first, if you need to install this function, delete the hashtag and run:
+#library(devtools)
+#install_github("timnewbold/StatisticalModels")
+library(StatisticalModels)
+GLMEROverdispersion(m2)
+#that's overdispersed. We'll deal with it in a minute. Let's at least look at the model
+summary(m2)
+se2 <- sqrt(diag(vcov(m2)))
+tab2 <- cbind(Est = fixef(m2), LL = fixef(m2) - 1.96 * se2, UL = fixef(m2) + 1.96 * se2)
+exp(tab2)
+```
+
+We lowered our AIC, which is good. Let's tackle the non-convergence of the model next.
+
+```{r}
+m3 <- glmer(FourW.alive ~ Years.bin + Proc + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + (1 | Genotype) + (1|Operator), data = cro_vial, family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+GLMEROverdispersion(m3)
+#better, but still overdispersed. Lets try a more conservative estimator of overdispersion (which, again, I'm not really that worried about)
+rdev2 <- sum(residuals(m3)^2)
+mdf2 <- length(fixef(m3))
+rdf2 <- nrow(cro_vial)-mdf2
+rdev2/rdf2
+#no overdispersion! Let's stop worrying about it for good.
+#Let's pull out operator because it makes me nervous. We should have a solid discussion on whether we should do this and what our justification is before a paper is submitted, though.
+m4 <- glmer(FourW.alive ~ Years.bin + Proc + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + (1 | Genotype), data = cro_vial, family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+#This is a little worse, but hopefully we can justify operator's removal from the model
+#not showing it here, but I did a stepwise removal of variables (-Proc, then -Age, then -twow.contam, then -PVS2, and the full model WITHOUT proc had the lowest AIC. So let's go with that.)
+m5 <- glmer(FourW.alive ~ Years.bin + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + (1 | Genotype), data = cro_vial, family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+#just for posterity, let's throw operator back in and compare AICs
+m6 <- glmer(FourW.alive ~ Years.bin + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + (1 | Genotype) + (1|Operator), data = cro_vial, family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+#AIC is lower with operator removed (m5) so let's pull it
+```
+
+
+```{r}
+set.seed(20)
+tmp <- sampler(cro_vial, "Genotype", reps = 100)
+#NOTE: increase reps if your computer can handle it! We need to get in at least the 1000s for a publication. In the write-up I did 10,000 but I don't want to break anyone's computer by throwing that in here.
+bigdata <- cbind(tmp, cro_vial[tmp$RowID, ])
+f <- fixef(m5)
+r <- getME(m5, "theta")
+cl <- makeCluster(4)
+#NOTE: change 4 to the number of processors you have!
+clusterExport(cl, c("bigdata", "f", "r"))
+clusterEvalQ(cl, require(lme4))
+
+#FOR THE LOVE OF GOD, RE-RUN THIS!!!
+
+myboot <- function(i) {
+    object <- try(glmer(FourW.alive ~ Years.bin + Init.Surv + TwoW.Contam + Age.Prec + PVS2.Control + (1 | NewID), data = bigdata, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)), subset = Replicate == i, family = binomial, nAGQ = 1, start = list(fixef = f, theta = r)), silent = TRUE)
+    if (class(object) == "try-error")
+        return(object)
+    c(fixef(object), getME(object, "theta"))
+}
+start <- proc.time()
+res <- parLapplyLB(cl, X = levels(bigdata$Replicate), fun = myboot)
+end <- proc.time()
+stopCluster(cl)
+success <- sapply(res, is.numeric)
+mean(success)
+#A lot more convergence this time around
+bigres <- do.call(cbind, res[success])
+(ci <- t(apply(bigres, 1, quantile, probs = c(0.025, 0.975))))
+se <- sqrt(diag(vcov(m5)))
+finaltable <- cbind(Est = c(f, r), SE = c(se, NA), BootMean = rowMeans(bigres), ci)
+round(finaltable, 3)
+```
+
+Now only initial survival is associated with survival - a 1% increase in initial survival increases final survival odds of at least one tip in a vial by 10% (exp(0.098)=1.103).
+
+```{r}
+#First, summarize initial survival
+summary(cro_vial$Init.Surv)
+#Okay, so it ranges from 0 to 100. Let's generate 100 values across the range of initial survival to use for prediction.
+tmpdat <- cro_vial[, c("Years.bin", "Proc", "Init.Surv", "TwoW.Contam", "Age.Prec", "PVS2.Control", "Genotype")]
+jvalues <- with(cro_vial, seq(from = 0, to = 100, length.out = 100))
+pp <- lapply(jvalues, function(j) {
+     tmpdat$Init.Surv <- j
+     predict(m5, newdata = tmpdat, type = "response", allow.new.levels = TRUE, na.action = na.omit)})
+#what is the average marginal predicted probability at the following initial survivals?
+sapply(pp[c(1, 20, 40, 60, 80, 100)], mean)
+#Let's plot
+plotdat <- t(sapply(pp, function(x) {
+    c(M = mean(x), quantile(x, c(0.25, 0.75)))
+}))
+plotdat <- as.data.frame(cbind(plotdat, jvalues))
+colnames(plotdat) <- c("PredictedProbability", "Lower", "Upper", "InitialSurvival")
+head(plotdat)
+ggplot(plotdat, aes(x = InitialSurvival, y = PredictedProbability)) + geom_line() +
+    ylim(c(0, 1))
+ggplot(plotdat, aes(x = InitialSurvival, y = PredictedProbability)) + geom_linerange(aes(ymin = Lower, ymax = Upper)) + geom_line(size = 2) + ylim(c(0, 1))
+```
+
+So it looks like we have a 95% probability of at least one tip survivng as long as initial survival is 37% or higher. We can bump to 99% probabilty if initial survival is 51%. 
